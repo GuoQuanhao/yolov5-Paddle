@@ -1,0 +1,10 @@
+# YOLOv5 reproduction 🚀 by GuoQuanhao
+
+train: /home/aistudio/guangshan/images/train  # 118287 images
+val: /home/aistudio/guangshan/images/val  # 5000 images
+
+# number of classes
+nc: 1
+
+# class names
+names: ['spectrum']
