@@ -101,8 +101,6 @@ Data
 |   |-- labels
 |      |-- train
 |      |-- val
-|   |-- val.txt
-|   |-- train.txt
 ```
 另外你需要构建`data/guangshan.yaml`，相关文件已放入相关目录，主要用于指定数据集读取路径和模型配置。
 ```
