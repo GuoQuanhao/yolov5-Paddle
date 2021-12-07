@@ -129,9 +129,8 @@ def run(data,
     
     if training:  # called by train.py
         device = model.parameters()[0].place  # get model device
+        names = model.names
     else:  # called directly
-        # Data
-          # number of classes
         device = select_device(device, batch_size=batch_size)
         # Directories
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
@@ -139,6 +138,7 @@ def run(data,
 
         # Load model
         check_suffix(weights, '.pdparams')
+        names = {k: v for k, v in enumerate(paddle.load(weights)['names'])}
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), mode='val')  # load FP32 model
         if flag:
             model.set_state_dict(paddle.load(model_state_dict_path)['state_dict'])
@@ -171,7 +171,6 @@ def run(data,
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
-    names = {k: v for k, v in enumerate(paddle.load(weights)['names'])}
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     dt, p, r, f1, mp, mr, map50, map = [0.0, 0.0, 0.0], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
