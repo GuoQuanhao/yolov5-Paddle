@@ -251,6 +251,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
     model.class_weights = labels_to_class_weights(dataset.labels, nc) * nc  # attach class weights
+    model.names = names
 
     # Start training
     t0 = time.time()
