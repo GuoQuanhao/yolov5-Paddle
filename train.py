@@ -126,7 +126,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         print(f'Transferred {len(csd)}/{len(state_dict)} items from {weights}')  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'))  # create
-
+    model.names = names
     # Freeze
     freeze = [f'model.{x}.' for x in range(freeze)]  # layers to freeze
     for k, v in model.named_parameters():
