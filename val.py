@@ -129,7 +129,7 @@ def run(data,
     
     if training:  # called by train.py
         device = model.parameters()[0].place  # get model device
-        names = model.names
+        names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model._layer.names)}
     else:  # called directly
         device = select_device(device, batch_size=batch_size)
         # Directories
@@ -138,11 +138,12 @@ def run(data,
 
         # Load model
         check_suffix(weights, '.pdparams')
-        names = {k: v for k, v in enumerate(paddle.load(weights)['names'])}
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), mode='val')  # load FP32 model
         if flag:
+            names = {k: v for k, v in enumerate(paddle.load(model_state_dict_path)['names'])}
             model.set_state_dict(paddle.load(model_state_dict_path)['state_dict'])
         else:
+            names = {k: v for k, v in enumerate(paddle.load(weights)['names'])}
             model.set_state_dict(paddle.load(weights)['state_dict'])
         model.fuse()
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
