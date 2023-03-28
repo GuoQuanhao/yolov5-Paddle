@@ -1,48 +1,114 @@
-# YOLOv5 reproduction 🚀 by GuoQuanhao
+# YOLOv5 Reproduction 🚀 by GuoQuanhao, GPL-3.0 license
 """
 Image augmentation functions
 """
 
-import logging
 import math
 import random
 
 import cv2
 import numpy as np
+import paddle.vision.transforms as T
+import paddle.vision.transforms.functional as TF
 
-from utils.general import colorstr, segment2box, resample_segments, check_version
+from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box, xywhn2xyxy, check_requirements
 from utils.metrics import bbox_ioa
+
+IMAGENET_MEAN = 0.485, 0.456, 0.406  # RGB mean
+IMAGENET_STD = 0.229, 0.224, 0.225  # RGB standard deviation
+
+check_requirements('albumentations')
+import albumentations as A
 
 
 class Albumentations:
     # YOLOv5 Albumentations class (optional, only used if package is installed)
-    def __init__(self):
+    def __init__(self, size=640):
         self.transform = None
+        prefix = colorstr('albumentations: ')
         try:
             import albumentations as A
             check_version(A.__version__, '1.0.3', hard=True)  # version requirement
 
-            self.transform = A.Compose([
+            T = [
+                A.RandomResizedCrop(height=size, width=size, scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0),
                 A.Blur(p=0.01),
                 A.MedianBlur(p=0.01),
                 A.ToGray(p=0.01),
                 A.CLAHE(p=0.01),
                 A.RandomBrightnessContrast(p=0.0),
                 A.RandomGamma(p=0.0),
-                A.ImageCompression(quality_lower=75, p=0.0)],
-                bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
+                A.ImageCompression(quality_lower=75, p=0.0)]  # transforms
+            self.transform = A.Compose(T, bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-            logging.info(colorstr('albumentations: ') + ', '.join(f'{x}' for x in self.transform.transforms if x.p))
+            LOGGER.info(prefix + ', '.join(f'{x}'.replace('always_apply=False, ', '') for x in T if x.p))
         except ImportError:  # package not installed, skip
             pass
         except Exception as e:
-            logging.info(colorstr('albumentations: ') + f'{e}')
+            LOGGER.info(f'{prefix}{e}')
 
     def __call__(self, im, labels, p=1.0):
         if self.transform and random.random() < p:
             new = self.transform(image=im, bboxes=labels[:, 1:], class_labels=labels[:, 0])  # transformed
             im, labels = new['image'], np.array([[c, *b] for c, b in zip(new['class_labels'], new['bboxes'])])
         return im, labels
+
+
+class HWC2CHW(A.BasicTransform):
+    """The numpy `HWC` image is converted to `CHW`.
+    If the image is in `HW` format (grayscale image), it will be converted to `HW` numpy.
+    This is a simplified and improved version of the old `Transpose`
+    transform (`Transpose` was deprecated, and now it is not present in Albumentations. You should use `HWC2CHW`
+    instead).
+    Args:
+        transpose_mask (bool): If True and an input mask has three dimensions, this transform will transpose dimensions
+            so the shape `[height, width, num_channels]` becomes `[num_channels, height, width]`. Default: False.
+        always_apply (bool): Indicates whether this transformation should be always applied. Default: True.
+        p (float): Probability of applying the transform. Default: 1.0.
+    """
+
+    def __init__(self, transpose_mask=False, always_apply=True, p=1.0):
+        super(HWC2CHW, self).__init__(always_apply=always_apply, p=p)
+        self.transpose_mask = transpose_mask
+
+    @property
+    def targets(self):
+        return {"image": self.apply, "mask": self.apply_to_mask, "masks": self.apply_to_masks}
+
+    def apply(self, img, **params):  # skipcq: PYL-W0613
+        if len(img.shape) not in [2, 3]:
+            raise ValueError("Albumentations only supports images in HW or HWC format")
+
+        if len(img.shape) == 2:
+            img = np.expand_dims(img, 2)
+
+        return img.transpose(2, 0, 1)
+
+    def apply_to_mask(self, mask, **params):  # skipcq: PYL-W0613
+        if self.transpose_mask and mask.ndim == 3:
+            mask = mask.transpose(2, 0, 1)
+        return mask
+
+    def apply_to_masks(self, masks, **params):
+        return [self.apply_to_mask(mask, **params) for mask in masks]
+
+    def get_transform_init_args_names(self):
+        return ("transpose_mask",)
+
+    def get_params_dependent_on_targets(self, params):
+        return {}
+
+
+def normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD, inplace=False):
+    # Denormalize RGB images x per ImageNet stats in BCHW format, i.e. = (x - mean) / std
+    return TF.normalize(x, mean, std, inplace=inplace)
+
+
+def denormalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD):
+    # Denormalize RGB images x per ImageNet stats in BCHW format, i.e. = x * std + mean
+    for i in range(3):
+        x[:, i] = x[:, i] * std[i] + mean[i]
+    return x
 
 
 def augment_hsv(im, hgain=0.5, sgain=0.5, vgain=0.5):
@@ -122,11 +188,15 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
     return im, ratio, (dw, dh)
 
 
-def random_perspective(im, targets=(), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
+def random_perspective(im,
+                       targets=(),
+                       segments=(),
+                       degrees=10,
+                       translate=.1,
+                       scale=.1,
+                       shear=10,
+                       perspective=0.0,
                        border=(0, 0)):
-    # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
-    # targets = [cls, xyxy]
-
     height = im.shape[0] + border[0] * 2  # shape(h,w,c)
     width = im.shape[1] + border[1] * 2
 
@@ -175,7 +245,7 @@ def random_perspective(im, targets=(), segments=(), degrees=10, translate=.1, sc
     # Transform label coordinates
     n = len(targets)
     if n:
-        use_segments = any(x.any() for x in segments)
+        use_segments = any(x.any() for x in segments) and len(segments) == n
         new = np.zeros((n, 4))
         if use_segments:  # warp segments
             segments = resample_segments(segments)  # upsample
@@ -224,12 +294,10 @@ def copy_paste(im, labels, segments, p=0.5):
             if (ioa < 0.30).all():  # allow 30% obscuration of existing labels
                 labels = np.concatenate((labels, [[l[0], *box]]), 0)
                 segments.append(np.concatenate((w - s[:, 0:1], s[:, 1:2]), 1))
-                cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (255, 255, 255), cv2.FILLED)
+                cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (1, 1, 1), cv2.FILLED)
 
-        result = cv2.bitwise_and(src1=im, src2=im_new)
-        result = cv2.flip(result, 1)  # augment segments (flip left-right)
-        i = result > 0  # pixels to replace
-        # i[:, :] = result.max(2).reshape(h, w, 1)  # act over ch
+        result = cv2.flip(im, 1)  # augment segments (flip left-right)
+        i = cv2.flip(im_new, 1).astype(bool)
         im[i] = result[i]  # cv2.imwrite('debug.jpg', im)  # debug
 
     return im, labels, segments
@@ -256,7 +324,7 @@ def cutout(im, labels, p=0.5):
             # return unobscured labels
             if len(labels) and s > 0.03:
                 box = np.array([xmin, ymin, xmax, ymax], dtype=np.float32)
-                ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
+                ioa = bbox_ioa(box, xywhn2xyxy(labels[:, 1:5], w, h))  # intersection over area
                 labels = labels[ioa < 0.60]  # remove >60% obscured labels
 
     return labels
@@ -270,9 +338,107 @@ def mixup(im, labels, im2, labels2):
     return im, labels
 
 
-def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
+def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
     w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
     ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
     return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)  # candidates
+
+
+def classify_albumentations(
+        augment=True,
+        size=224,
+        scale=(0.08, 1.0),
+        ratio=(0.75, 1.0 / 0.75),  # 0.75, 1.33
+        hflip=0.5,
+        vflip=0.0,
+        jitter=0.4,
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD,
+        auto_aug=False):
+    # YOLOv5 classification Albumentations (optional, only used if package is installed)
+    prefix = colorstr('albumentations: ')
+    try:
+        import albumentations as A
+        check_version(A.__version__, '1.0.3', hard=True)  # version requirement
+        if augment:  # Resize and crop
+            T = [A.RandomResizedCrop(height=size, width=size, scale=scale, ratio=ratio)]
+            if auto_aug:
+                # TODO: implement AugMix, AutoAug & RandAug in albumentation
+                LOGGER.info(f'{prefix}auto augmentations are currently not supported')
+            else:
+                if hflip > 0:
+                    T += [A.HorizontalFlip(p=hflip)]
+                if vflip > 0:
+                    T += [A.VerticalFlip(p=vflip)]
+                if jitter > 0:
+                    color_jitter = (float(jitter),) * 3  # repeat value for brightness, contrast, satuaration, 0 hue
+                    T += [A.ColorJitter(*color_jitter, 0)]
+        else:  # Use fixed crop for eval set (reproducibility)
+            T = [A.SmallestMaxSize(max_size=size), A.CenterCrop(height=size, width=size)]
+        T += [A.Normalize(mean=mean, std=std), HWC2CHW()]  # Normalize and convert to Tensor
+        LOGGER.info(prefix + ', '.join(f'{x}'.replace('always_apply=False, ', '') for x in T if x.p))
+        return A.Compose(T)
+
+    except ImportError:  # package not installed, skip
+        LOGGER.warning(f'{prefix}⚠️ not found, install with `pip install albumentations` (recommended)')
+    except Exception as e:
+        LOGGER.info(f'{prefix}{e}')
+
+
+def classify_transforms(size=224):
+    # Transforms to apply if albumentations not installed
+    assert isinstance(size, int), f'ERROR: classify_transforms size {size} must be integer, not (list, tuple)'
+    # T.Compose([T.Transpose(), T.Resize(size), T.CenterCrop(size), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
+    return T.Compose([CenterCrop(size), Transpose(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
+
+
+class LetterBox:
+    # YOLOv5 LetterBox class for image preprocessing, i.e. T.Compose([LetterBox(size), Transpose()])
+    def __init__(self, size=(640, 640), auto=False, stride=32):
+        super().__init__()
+        self.h, self.w = (size, size) if isinstance(size, int) else size
+        self.auto = auto  # pass max size integer, automatically solve for short side using stride
+        self.stride = stride  # used with auto
+
+    def __call__(self, im):  # im = np.array HWC
+        imh, imw = im.shape[:2]
+        r = min(self.h / imh, self.w / imw)  # ratio of new/old
+        h, w = round(imh * r), round(imw * r)  # resized image
+        hs, ws = (math.ceil(x / self.stride) * self.stride for x in (h, w)) if self.auto else self.h, self.w
+        top, left = round((hs - h) / 2 - 0.1), round((ws - w) / 2 - 0.1)
+        im_out = np.full((self.h, self.w, 3), 114, dtype=im.dtype)
+        im_out[top:top + h, left:left + w] = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+        return im_out
+
+
+class CenterCrop:
+    # YOLOv5 CenterCrop class for image preprocessing, i.e. T.Compose([CenterCrop(size), Transpose()])
+    def __init__(self, size=640):
+        super().__init__()
+        self.h, self.w = (size, size) if isinstance(size, int) else size
+
+    def __call__(self, im):  # im = np.array HWC
+        imh, imw = im.shape[:2]
+        m = min(imh, imw)  # min dimension
+        top, left = (imh - m) // 2, (imw - m) // 2
+        return cv2.resize(im[top:top + m, left:left + m], (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+
+
+class Transpose(T.BaseTransform):
+    # YOLOv5 Transpose class for image preprocessing, i.e. T.Compose([LetterBox(size), Transpose()])
+    def __init__(self, order=(2, 0, 1), keys=None):
+        super(Transpose, self).__init__(keys)
+        self.order = order
+    
+    def _apply_image(self, img):
+        if TF._is_tensor_image(img):
+            return img.transpose(self.order)[::-1] / 255.0 # HWC to CHW -> BGR to RGB
+
+        if TF._is_pil_image(img):
+            img = np.asarray(img)
+
+        if len(img.shape) == 2:
+            img = img[..., np.newaxis]
+        return img.transpose(self.order)[::-1] / 255.0 # HWC to CHW -> BGR to RGB

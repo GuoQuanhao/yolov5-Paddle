@@ -1,32 +1,37 @@
-# YOLOv5 reproduction 🚀 by GuoQuanhao
+# YOLOv5 Reproduction 🚀 by GuoQuanhao, GPL-3.0 license
 """
-YOLO-specific layers
+YOLO-specific modules
 
 Usage:
-    $ python path/to/models/yolo.py --cfg yolov5s.yaml
+    $ python models/yolo.py --cfg yolov5s.yaml
 """
 
 import argparse
+import contextlib
+import os
+import platform
 import sys
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+import paddle.nn.initializer as Initializer
 from copy import deepcopy
 from pathlib import Path
-import paddle.nn.functional as F
-import paddle.nn as nn
-import paddle
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-# ROOT = ROOT.relative_to(Path.cwd())  # relative
+if platform.system() != 'Windows':
+    ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
-from utils.general import check_version, check_yaml, make_divisible, print_args, LOGGER
+from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
-from utils.paddle_utils import copy_attr, fuse_conv_and_bn, initialize_weights, model_info, scale_img, \
-    select_device, time_sync
+from utils.paddle_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
+                               time_sync)
 
 try:
     import thop  # for FLOPs computation
@@ -35,19 +40,21 @@ except ImportError:
 
 
 class Detect(nn.Layer):
+    # YOLOv5 Detect head for detection models
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
         super().__init__()
-        self.onnx_dynamic = False  # ONNX export parameter
-        self.stride = None  # strides computed during build
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [paddle.zeros([1])] * self.nl  # init grid
-        self.anchor_grid = [paddle.zeros([1])] * self.nl  # init anchor grid
-        self.register_buffer('anchors', paddle.to_tensor(anchors).astype('float32').reshape([self.nl, -1, 2]))  # shape(nl,na,2)
+        self.grid = [paddle.empty([0]) for _ in range(self.nl)]  # init grid
+        self.anchor_grid = [paddle.empty([0]) for _ in range(self.nl)]  # init anchor grid
+        self.register_buffer('anchors', paddle.to_tensor(anchors, dtype='float32').reshape([self.nl, -1, 2]))  # shape(nl,na,2)
         self.m = nn.LayerList(nn.Conv2D(x, self.no * self.na, 1) for x in ch)  # output conv
-        self.inplace = inplace  # use in-place ops (e.g. slice assignment)
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = None  # strides computed during build
+        self.dynamic = False  # force grid reconstruction
+        self.export = False  # export mode
 
     def forward(self, x):
         z = []  # inference output
@@ -57,70 +64,149 @@ class Detect(nn.Layer):
             x[i] = x[i].reshape([bs, self.na, self.no, ny, nx]).transpose([0, 1, 3, 4, 2])
 
             if not self.training:  # inference
-                if self.grid[i].shape[2:4] != x[i].shape[2:4] or self.onnx_dynamic:
+                if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
-                y = F.sigmoid(x[i])
-                if self.inplace:
-                    y[:,:,:,:, 0:2] = (y[:,:,:,:, 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    y[:,:,:,:, 2:4] = (y[:,:,:,:, 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
-                    xy = (y[:,:,:,:, 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (y[:,:,:,:, 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                    y = paddle.concat((xy, wh, y[:,:,:,:, 4:]), -1)
-                z.append(y.reshape([bs, -1, self.no]))
+                if isinstance(self, Segment):  # (boxes + masks)
+                    xy, wh, conf, mask = x[i].split((2, 2, self.nc + 1, self.no - self.nc - 5), 4)
+                    xy = (F.sigmoid(xy) * 2 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (F.sigmoid(wh) * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = paddle.concat((xy, wh, F.sigmoid(conf), mask), 4)
+                else:  # Detect (boxes only)
+                    xy, wh, conf = F.sigmoid(x[i]).split((2, 2, self.nc + 1), 4)
+                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = paddle.concat((xy, wh, conf), 4)
+                z.append(y.reshape([bs, self.na * nx * ny, self.no]))
 
-        return x if self.training else (paddle.concat(z, 1), x)
+        return x if self.training else (paddle.concat(z, 1),) if self.export else (paddle.concat(z, 1), x)
 
     def _make_grid(self, nx=20, ny=20, i=0):
-        if check_version(paddle.__version__, '2.0.0'):  # you should use paddle version>=2.0.0
-            yv, xv = paddle.meshgrid([paddle.arange(ny), paddle.arange(nx)], indexing='ij')
-        else:
-            yv, xv = paddle.meshgrid([paddle.arange(ny), paddle.arange(nx)])
-        grid = paddle.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).astype('float32')
-        anchor_grid = (self.anchors[i].clone() * self.stride[i]) \
-            .reshape((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).astype('float32')
+        t = self.anchors[i].dtype
+        shape = 1, self.na, ny, nx, 2  # grid shape
+        y, x = paddle.arange(ny, dtype=t), paddle.arange(nx, dtype=t)
+        yv, xv = paddle.meshgrid(y, x, indexing='ij')
+        grid = paddle.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
+        anchor_grid = (self.anchors[i] * self.stride[i]).reshape((1, self.na, 1, 1, 2)).expand(shape)
         return grid, anchor_grid
 
 
-class Model(nn.Layer):
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None, mode='training'):  # model, input channels, number of classes
+class Segment(Detect):
+    # YOLOv5 Segment head for segmentation models
+    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
+        super().__init__(nc, anchors, ch, inplace)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.no = 5 + nc + self.nm  # number of outputs per anchor
+        self.m = nn.LayerList(nn.Conv2D(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+        self.detect = Detect.forward
+
+    def forward(self, x):
+        p = self.proto(x[0])
+        x = self.detect(self, x)
+        return (x, p) if self.training else (x[0], p) if self.export else (x[0], p, x[1])
+
+
+class BaseModel(nn.Layer):
+    # YOLOv5 base model
+    def forward(self, x, profile=False, visualize=False):
+        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+
+    def _forward_once(self, x, profile=False, visualize=False):
+        y, dt = [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+        return x
+
+    def _profile_one_layer(self, m, x, dt):
+        c = m == self.model[-1]  # is final layer, copy input as inplace fix
+        o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
+        t = time_sync()
+        for _ in range(10):
+            m(x.copy() if c else x)
+        dt.append((time_sync() - t) * 100)
+        if m == self.model[0]:
+            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
+        LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
+        if c:
+            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+
+    def fuse(self, check_amp=False):  # fuse model Conv2D() + BatchNorm2D() layers
+        if not check_amp:
+            LOGGER.info('Fusing layers... ')
+        for m in self.model.sublayers():
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                delattr(m, 'bn')  # remove batchnorm
+                m.forward = m.forward_fuse  # update forward
+        self.info(check_amp=check_amp)
+        return self
+
+    def info(self, verbose=False, check_amp=False, img_size=640):  # print model information
+        model_info(self, verbose, check_amp, img_size)
+
+    def _apply(self, fn):
+        # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
+        self = super()._apply(fn)
+        m = self.model[-1]  # Detect()
+        if isinstance(m, (Detect, Segment)):
+            m.stride = fn(m.stride)
+            m.grid = list(map(fn, m.grid))
+            if isinstance(m.anchor_grid, list):
+                m.anchor_grid = list(map(fn, m.anchor_grid))
+        return self
+
+
+class DetectionModel(BaseModel):
+    # YOLOv5 detection model
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None, verbose=False):  # model, input channels, number of classes
         super().__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
         else:  # is *.yaml
             import yaml  # for paddle hub
             self.yaml_file = Path(cfg).name
-            with open(cfg, errors='ignore') as f:
+            with open(cfg, encoding='ascii', errors='ignore') as f:
                 self.yaml = yaml.safe_load(f)  # model dict
 
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
         if nc and nc != self.yaml['nc']:
-            print(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         if anchors:
-            print(f'Overriding model.yaml anchors with anchors={anchors}')
+            LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch], mode=mode)  # model, savelist
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch], verbose=verbose)  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
+        self.nc = nc
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
+        if isinstance(m, (Detect, Segment)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
-            m.stride = paddle.to_tensor([s / x.shape[-2] for x in self.forward(paddle.zeros([1, ch, s, s]))])  # forward
-            m.anchors /= m.stride.reshape([-1, 1, 1])
+            forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
+            m.stride = paddle.to_tensor([s / x.shape[-2] for x in forward(paddle.zeros([1, ch, s, s], dtype=paddle.get_default_dtype()))])  # forward
             check_anchor_order(m)
+            m.anchors /= m.stride.reshape([-1, 1, 1])
             self.stride = m.stride
             self._initialize_biases()  # only run once
 
         # Init weights, biases
         initialize_weights(self)
-        self.info()
-        print('')
+        if verbose:
+            self.info()
+            LOGGER.info('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
@@ -140,19 +226,6 @@ class Model(nn.Layer):
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
         return paddle.concat(y, 1), None  # augmented inference, train
-
-    def _forward_once(self, x, profile=False, visualize=False):
-        y, dt = [], []  # outputs
-        for m in self.model:
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            if profile:
-                self._profile_one_layer(m, x, dt)
-            x = m(x)
-            y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
-        return x
 
     def _descale_pred(self, p, flips, scale, img_size):
         # de-scale predictions following augmented inference (inverse operation)
@@ -182,107 +255,95 @@ class Model(nn.Layer):
         y[-1] = y[-1][:, i:]  # small
         return y
 
-    def _profile_one_layer(self, m, x, dt):
-        c = isinstance(m, Detect)  # is final layer, copy input as inplace fix
-        o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
-        t = time_sync()
-        for _ in range(10):
-            m(x.copy() if c else x)
-        dt.append((time_sync() - t) * 100)
-        if m == self.model[0]:
-            print(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'layer'}")
-        print(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
-        if c:
-            print(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
-
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
-        m = self.model[-1]  # Detect() layer
+        # cf = paddle.bincount(paddle.to_tensor(np.concatenate(dataset.labels, 0)[:, 0], dtype='int64), minlength=nc) + 1.
+        m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
             b = mi.bias.reshape([m.na, -1])  # conv.bias(255) to (3,85)
             b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else paddle.log(cf / cf.sum())  # cls
-            mi.bias = paddle.create_parameter(shape=b.flatten().shape, dtype='float32',
-                           default_initializer=paddle.nn.initializer.Assign(b.flatten()))
-
-    def _print_biases(self):
-        m = self.model[-1]  # Detect() layer
-        for mi in m.m:  # from
-            b = mi.bias.detach().reshape([m.na, -1]).t()  # conv.bias(255) to (3,85)
-            print(
-                ('%6g Conv2D.bias:' + '%10.3g' * 6) % (mi.weight.shape[1], *b[:5].mean(1).tolist(), b[5:].mean()))
-
-    # def _print_weights(self):
-    #     for m in self.model.sublayers():
-    #         if type(m) is Bottleneck:
-    #             print('%10.3g' % (F.sigmoid(m.w.detach()) * 2))  # shortcut weights
-
-    def fuse(self):  # fuse model Conv2D() + BatchNorm2D() layers
-        print('Fusing layers... ')
-        for m in self.model.sublayers():
-            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
-                m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
-                delattr(m, 'bn')  # remove batchnorm
-                m.forward = m.forward_fuse  # update forward
-        self.info()
-        return self
-
-    def autoshape(self):  # add AutoShape layer
-        print('Adding AutoShape... ')
-        m = AutoShape(self)  # wrap model
-        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
-        return m
-
-    def info(self, verbose=False, img_size=640):  # print model information
-        model_info(self, verbose, img_size)
-
-    def _apply(self, fn):
-        # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
-        self = super()._apply(fn)
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
-            m.stride = fn(m.stride)
-            m.grid = list(map(fn, m.grid))
-            if isinstance(m.anchor_grid, list):
-                m.anchor_grid = list(map(fn, m.anchor_grid))
-        return self
+            b[:, 5:5 + m.nc] += math.log(0.6 / (m.nc - 0.99999)) if cf is None else paddle.log(cf / cf.sum())  # cls
+            mi.bias = paddle.create_parameter(shape=b.flatten().shape, dtype=b.dtype,
+                                             default_initializer=Initializer.Assign(b.flatten()))
 
 
-def parse_model(d, ch, mode='training'):  # model_dict, input_channels(3)
-    if mode == 'training':
-        print(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'layer':<40}{'arguments':<30}")
-    anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
+Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
+
+
+class SegmentationModel(DetectionModel):
+    # YOLOv5 segmentation model
+    def __init__(self, cfg='yolov5s-seg.yaml', ch=3, nc=None, anchors=None, verbose=False):
+        super().__init__(cfg, ch, nc, anchors, verbose)
+
+
+class ClassificationModel(BaseModel):
+    # YOLOv5 classification model
+    def __init__(self, cfg=None, model=None, nc=1000, cutoff=9):  # yaml, model, number of classes, cutoff index
+        super().__init__()
+        self._from_detection_model(model, nc, cutoff) if model is not None else self._from_yaml(cfg)
+
+    def _from_detection_model(self, model, nc=1000, cutoff=9):
+        # Create a YOLOv5 classification model from a YOLOv5 detection model
+        if isinstance(model, DetectMultiBackend):
+            model = model.model  # unwrap DetectMultiBackend
+        model.model = model.model[:cutoff]  # backbone
+        m = model.model[-1]  # last layer
+        ch = m.conv._in_channels if hasattr(m, 'conv') else m.cv1.conv._in_channels  # ch into module
+        c = Classify(ch, nc)  # Classify()
+        c.i, c.f, c.type = m.i, m.f, 'models.common.Classify'  # index, from, type
+        model.model[cutoff] = c  # replace
+        self.model = model.model
+        self.stride = model.stride
+        self.save = []
+        self.nc = nc
+
+    def _from_yaml(self, cfg):
+        # Create a YOLOv5 classification model from a *.yaml file
+        self.model = None
+
+
+def parse_model(d, ch, verbose=False):  # model_dict, input_channels(3)
+    # Parse a YOLOv5 model.yaml dictionary
+    if verbose:
+        LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
+    if act:
+        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.Silu()
+        if verbose:
+            LOGGER.info(f"{colorstr('activation:')} {act}")  # print
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, layer, args
+    for i, (f, n, m, args) in enumerate(d['backbone'] + d.get('head', [])):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
-            try:
+            with contextlib.suppress(NameError):
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
-            except NameError:
-                pass
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost]:
+        if m in {
+                Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.Conv2DTranspose, DWConvTranspose2d, C3x}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3TR, C3Ghost]:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2D:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m is Detect:
+        # TODO: channel, gw, gd
+        elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
+            if m is Segment:
+                args[3] = make_divisible(args[3] * gw, 8)
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
@@ -290,12 +351,12 @@ def parse_model(d, ch, mode='training'):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # layer
-        t = str(m)[8:-2].replace('__main__.', '')  # layer type
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = int(sum(x.numel() for x in m_.parameters()))  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        if mode == 'training':
-            print(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        if verbose:
+            LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
@@ -307,23 +368,33 @@ def parse_model(d, ch, mode='training'):  # model_dict, input_channels(3)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
+    parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--profile', action='store_true', help='profile model speed')
+    parser.add_argument('--line-profile', action='store_true', help='profile model speed layer by layer')
+    parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
     opt = parser.parse_args()
     opt.cfg = check_yaml(opt.cfg)  # check YAML
-    print_args(FILE.stem, opt)
+    print_args(vars(opt))
     device = select_device(opt.device)
 
     # Create model
-    model = Model(opt.cfg)
-    model.train()
+    im = paddle.rand([opt.batch_size, 3, 640, 640]).to(device)
+    model = Model(opt.cfg).to(device)
 
-    # Profile
-    if opt.profile:
-        img = paddle.rand([8 if paddle.device.is_compiled_with_cuda() else 1, 3, 640, 640])
-        y = model(img, profile=True)
+    # Options
+    if opt.line_profile:  # profile layer by layer
+        model(im, profile=True)
 
-    # LogWriter (https://github.com/PaddlePaddle/VisualDL)
-    # from visualdl import LogWriter
-    # vl_writer = LogWriter('.')
-    # print("Run 'visualdl --logdir=models' to view VisualDL at http://localhost:6006/")
+    elif opt.profile:  # profile forward-backward
+        results = profile(input=im, ops=[model], n=3)
+
+    elif opt.test:  # test all models
+        for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
+            try:
+                _ = Model(cfg)
+            except Exception as e:
+                print(f'Error in {cfg}: {e}')
+
+    else:  # report fused model summary
+        model.fuse()

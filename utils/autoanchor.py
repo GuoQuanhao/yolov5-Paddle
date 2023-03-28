@@ -1,6 +1,6 @@
-# YOLOv5 reproduction 🚀 by GuoQuanhao
+# YOLOv5 Reproduction 🚀 by GuoQuanhao, GPL-3.0 license
 """
-Auto-anchor utils
+AutoAnchor utils
 """
 
 import random
@@ -9,55 +9,59 @@ import numpy as np
 import paddle
 import yaml
 from tqdm import tqdm
-from utils.general import colorstr
+
+from utils import TryExcept
+from utils.general import LOGGER, TQDM_BAR_FORMAT, colorstr
+
+PREFIX = colorstr('AutoAnchor: ')
 
 
 def check_anchor_order(m):
-    # Check anchor order against stride order for YOLOv5 Detect() module m, and correct if necessary
-    a = m.anchors.prod(-1).flatten()  # anchor area
+    # Check anchor order against stride order for YOLOv5 Detect() layer m, and correct if necessary
+    a = m.anchors.prod(-1).mean(-1).reshape([-1])  # mean anchor area per output layer
     da = a[-1] - a[0]  # delta a
     ds = m.stride[-1] - m.stride[0]  # delta s
-    if da.sign() != ds.sign():  # same order
-        print('Reversing anchor order')
+    if da and (da.sign() != ds.sign()):  # same order
+        LOGGER.info(f'{PREFIX}Reversing anchor order')
         m.anchors[:] = m.anchors.flip(0)
 
 
+@TryExcept(f'{PREFIX}ERROR')
 def check_anchors(dataset, model, thr=4.0, imgsz=640):
     # Check anchor fit to data, recompute if necessary
-    prefix = colorstr('autoanchor: ')
-    print(f'\n{prefix}Analyzing anchors... ', end='')
-    m = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]  # Detect()
+    m = model._layers.model[-1] if hasattr(model, '_layers') else model.model[-1]  # Detect()
     shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
     scale = np.random.uniform(0.9, 1.1, size=(shapes.shape[0], 1))  # augment scale
-    wh = paddle.to_tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).astype('float32')  # wh
+    wh = paddle.to_tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).astype(paddle.float32)  # wh
 
     def metric(k):  # compute metric
-        r = wh.unsqueeze(1) / k.unsqueeze(0)
-        x = paddle.minimum(r, 1. / r).min(2)  # ratio metric
+        r = wh[:, None] / k[None]
+        x = paddle.minimum(r, 1 / r).min(2)  # ratio metric
         best = x.max(1)  # best_x
-        aat = float((x > 1. / thr).astype('float32').sum(1).mean())  # anchors above threshold
-        bpr = float((best > 1. / thr).astype('float32').mean())  # best possible recall
+        aat = (x > 1 / thr).astype(paddle.float32).sum(1).mean()  # anchors above threshold
+        bpr = (best > 1 / thr).astype(paddle.float32).mean()  # best possible recall
         return bpr, aat
 
-    anchors = m.anchors.clone() * m.stride.reshape([-1, 1, 1])  # current anchors
+    stride = m.stride.reshape([-1, 1, 1])  # model strides
+    anchors = m.anchors.clone() * stride  # current anchors
     bpr, aat = metric(anchors.cpu().reshape([-1, 2]))
-    print(f'anchors/target = {aat:.2f}, Best Possible Recall (BPR) = {bpr:.4f}', end='')
-    if bpr < 0.98:  # threshold to recompute
-        print('. Attempting to improve anchors, please wait...')
+    s = f'\n{PREFIX}{aat.item():.2f} anchors/target, {bpr.item():.3f} Best Possible Recall (BPR). '
+    if bpr > 0.98:  # threshold to recompute
+        LOGGER.info(f'{s}Current anchors are a good fit to dataset ✅')
+    else:
+        LOGGER.info(f'{s}Anchors are a poor fit to dataset ⚠️, attempting to improve...')
         na = m.anchors.numel() // 2  # number of anchors
-        try:
-            anchors = kmean_anchors(dataset, n=na, img_size=imgsz, thr=thr, gen=1000, verbose=False)
-        except Exception as e:
-            print(f'{prefix}ERROR: {e}')
+        anchors = kmean_anchors(dataset, n=na, img_size=imgsz, thr=thr, gen=1000, verbose=False)
         new_bpr = metric(anchors)[0]
         if new_bpr > bpr:  # replace anchors
             anchors = paddle.to_tensor(anchors, device=m.anchors.device).type_as(m.anchors)
-            m.anchors[:] = anchors.clone().reshape(m.anchors.shape) / m.stride.reshape([-1, 1, 1])  # loss
-            check_anchor_order(m)
-            print(f'{prefix}New anchors saved to model. Update model *.yaml to use these anchors in the future.')
+            m.anchors[:] = anchors.clone().view_as(m.anchors)
+            check_anchor_order(m)  # must be in pixel-space (not grid-space)
+            m.anchors /= stride
+            s = f'{PREFIX}Done ✅ (optional: update model *.yaml to use these anchors in the future)'
         else:
-            print(f'{prefix}Original anchors better than new anchors. Proceeding with original anchors.')
-    print('')  # newline
+            s = f'{PREFIX}Done ⚠️ (original anchors better than new anchors, proceeding with original anchors)'
+        LOGGER.info(s)
 
 
 def kmean_anchors(dataset='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=1000, verbose=True):
@@ -79,34 +83,36 @@ def kmean_anchors(dataset='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen
     """
     from scipy.cluster.vq import kmeans
 
-    thr = 1. / thr
-    prefix = colorstr('autoanchor: ')
+    npr = np.random
+    thr = 1 / thr
 
     def metric(k, wh):  # compute metrics
-        r = wh.unsqueeze(1) / k.unsqueeze(0)
-        x = paddle.minimum(r, 1. / r).min(2)[0]  # ratio metric
+        r = wh[:, None] / k[None]
+        x = paddle.minimum(r, 1 / r).min(2)  # ratio metric
         # x = wh_iou(wh, paddle.to_tensor(k))  # iou metric
-        return x, x.max(1)[0]  # x, best_x
+        return x, x.max(1)  # x, best_x
 
     def anchor_fitness(k):  # mutation fitness
         _, best = metric(paddle.to_tensor(k, dtype=paddle.float32), wh)
-        return (best * (best > thr).astype('float32')).mean()  # fitness
+        return (best * (best > thr).astype(paddle.float32)).mean()  # fitness
 
-    def print_results(k):
+    def print_results(k, verbose=True):
         k = k[np.argsort(k.prod(1))]  # sort small to large
         x, best = metric(k, wh0)
-        bpr, aat = int((best > thr).astype('float32').mean()), int((x > thr).astype('float32').mean() * n)  # best possible recall, anch > thr
-        print(f'{prefix}thr={thr:.2f}: {bpr:.4f} best possible recall, {aat:.2f} anchors past thr')
-        print(f'{prefix}n={n}, img_size={img_size}, metric_all={x.mean():.3f}/{best.mean():.3f}-mean/best, '
-              f'past_thr={x[x > thr].mean():.3f}-mean: ', end='')
-        for i, x in enumerate(k):
-            print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
+        bpr, aat = (best > thr).astype(paddle.float32).mean(), (x > thr).astype(paddle.float32).mean() * n  # best possible recall, anch > thr
+        s = f'{PREFIX}thr={thr:.2f}: {bpr:.4f} best possible recall, {aat:.2f} anchors past thr\n' \
+            f'{PREFIX}n={n}, img_size={img_size}, metric_all={x.mean():.3f}/{best.mean():.3f}-mean/best, ' \
+            f'past_thr={x[x > thr].mean():.3f}-mean: '
+        for x in k:
+            s += '%i,%i, ' % (round(x[0]), round(x[1]))
+        if verbose:
+            LOGGER.info(s[:-2])
         return k
 
     if isinstance(dataset, str):  # *.yaml file
         with open(dataset, errors='ignore') as f:
             data_dict = yaml.safe_load(f)  # model dict
-        from utils.datasets import LoadImagesAndLabels
+        from utils.dataloaders import LoadImagesAndLabels
         dataset = LoadImagesAndLabels(data_dict['train'], augment=True, rect=True)
 
     # Get label wh
@@ -116,19 +122,22 @@ def kmean_anchors(dataset='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen
     # Filter
     i = (wh0 < 3.0).any(1).sum()
     if i:
-        print(f'{prefix}WARNING: Extremely small objects found. {i} of {len(wh0)} labels are < 3 pixels in size.')
-    wh = wh0[(wh0 >= 2.0).any(1)]  # filter > 2 pixels
-    # wh = wh * (np.random.rand(wh.shape[0], 1) * 0.9 + 0.1)  # multiply by random scale 0-1
+        LOGGER.info(f'{PREFIX}WARNING ⚠️ Extremely small objects found: {i} of {len(wh0)} labels are <3 pixels in size')
+    wh = wh0[(wh0 >= 2.0).any(1)].astype(np.float32)  # filter > 2 pixels
+    # wh = wh * (npr.rand(wh.shape[0], 1) * 0.9 + 0.1)  # multiply by random scale 0-1
 
-    # Kmeans calculation
-    print(f'{prefix}Running kmeans for {n} anchors on {len(wh)} points...')
-    s = wh.std(0)  # sigmas for whitening
-    k, dist = kmeans(wh / s, n, iter=30)  # points, mean distance
-    assert len(k) == n, f'{prefix}ERROR: scipy.cluster.vq.kmeans requested {n} points but returned only {len(k)}'
-    k *= s
-    wh = paddle.to_tensor(wh, dtype=paddle.float32)  # filtered
-    wh0 = paddle.to_tensor(wh0, dtype=paddle.float32)  # unfiltered
-    k = print_results(k)
+    # Kmeans init
+    try:
+        LOGGER.info(f'{PREFIX}Running kmeans for {n} anchors on {len(wh)} points...')
+        assert n <= len(wh)  # apply overdetermined constraint
+        s = wh.std(0)  # sigmas for whitening
+        k = kmeans(wh / s, n, iter=30)[0] * s  # points
+        assert n == len(k)  # kmeans may return fewer points than requested if wh is insufficient or too similar
+    except Exception:
+        LOGGER.warning(f'{PREFIX}WARNING ⚠️ switching strategies from kmeans to random init')
+        k = np.sort(npr.rand(n * 2)).reshape(n, 2) * img_size  # random init
+    wh, wh0 = (paddle.to_tensor(x, dtype=paddle.float32) for x in (wh, wh0))
+    k = print_results(k, verbose=False)
 
     # Plot
     # k, d = [None] * 20, [None] * 20
@@ -143,9 +152,8 @@ def kmean_anchors(dataset='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen
     # fig.savefig('wh.png', dpi=200)
 
     # Evolve
-    npr = np.random
     f, sh, mp, s = anchor_fitness(k), k.shape, 0.9, 0.1  # fitness, generations, mutation prob, sigma
-    pbar = tqdm(range(gen), desc=f'{prefix}Evolving anchors with Genetic Algorithm:')  # progress bar
+    pbar = tqdm(range(gen), bar_format=TQDM_BAR_FORMAT)  # progress bar
     for _ in pbar:
         v = np.ones(sh)
         while (v == 1).all():  # mutate until a change occurs (prevent duplicates)
@@ -154,8 +162,8 @@ def kmean_anchors(dataset='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen
         fg = anchor_fitness(kg)
         if fg > f:
             f, k = fg, kg.copy()
-            pbar.desc = f'{prefix}Evolving anchors with Genetic Algorithm: fitness = {f:.4f}'
+            pbar.desc = f'{PREFIX}Evolving anchors with Genetic Algorithm: fitness = {f:.4f}'
             if verbose:
-                print_results(k)
+                print_results(k, verbose)
 
-    return print_results(k)
+    return print_results(k).astype(np.float32)

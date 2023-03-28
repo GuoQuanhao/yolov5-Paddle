@@ -1,4 +1,4 @@
-# YOLOv5 reproduction 🚀 by GuoQuanhao
+# YOLOv5 Reproduction 🚀 by GuoQuanhao, GPL-3.0 license
 """
 Loss functions
 """
@@ -8,8 +8,7 @@ import paddle.nn as nn
 import paddle.nn.functional as F
 
 from utils.metrics import bbox_iou
-from utils.paddle_utils import is_parallel
-import numpy as np
+from utils.paddle_utils import de_parallel
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
@@ -46,7 +45,7 @@ class FocalLoss(nn.Layer):
 
     def forward(self, pred, true):
         loss = self.loss_fcn(pred, true)
-        # p_t = paddle.exp(-loss)
+        # p_t = padldle.exp(-loss)
         # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
 
         # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
@@ -89,11 +88,13 @@ class QFocalLoss(nn.Layer):
         else:  # 'none'
             return loss
 
+
 class ComputeLoss:
+    sort_obj_iou = False
+
     # Compute losses
     def __init__(self, model, autobalance=False):
-        self.sort_obj_iou = False
-        h = model.hyp  # hyperparameters
+        h = de_parallel(model).hyp  # hyperparameters
 
         # Define criteria
         BCEcls = nn.BCEWithLogitsLoss(pos_weight=paddle.to_tensor([h['cls_pw']]))
@@ -107,51 +108,58 @@ class ComputeLoss:
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        det = model._layer.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
-        self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
-        self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        m = de_parallel(model).model[-1]  # Detect() module
+        self.balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
+        self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, 1.0, h, autobalance
-        for k in 'na', 'nc', 'nl', 'anchors':
-            setattr(self, k, getattr(det, k))
+        self.na = m.na  # number of anchors
+        self.nc = m.nc  # number of classes
+        self.nl = m.nl  # number of layers
+        self.anchors = m.anchors
 
-    def __call__(self, p, targets):  # predictions, targets, model
-        lcls, lbox, lobj = paddle.zeros([1]), paddle.zeros([1]), paddle.zeros([1])
-        tcls, tbox, indices, anchors = self.build_targets(p, targets.numpy())  # targets
+    def __call__(self, p, targets):  # predictions, targets
+        lcls = paddle.zeros([1])  # class loss
+        lbox = paddle.zeros([1])  # box loss
+        lobj = paddle.zeros([1])  # object loss
+        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-            tobj = paddle.zeros_like(pi[:,:,:,:, 0])  # target obj
+            tobj = paddle.zeros(pi.shape[:4], dtype=pi.dtype)  # target obj
 
             n = b.shape[0]  # number of targets
             if n:
-                # ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
-                ps = pi.gather_nd(paddle.concat([b.reshape([-1, 1]), a.reshape([-1, 1]), gj.reshape([-1, 1]), gi.reshape([-1, 1])], 1))
+                # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), axis=1)  # faster, requires paddle 2.1.0
+                pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+
                 # Regression
-                pxy = F.sigmoid(ps[:, :2]) * 2. - 0.5
-                pwh = (F.sigmoid(ps[:, 2:4]) * 2) ** 2 * anchors[i]
+                pxy = F.sigmoid(pxy) * 2 - 0.5
+                pwh = (F.sigmoid(pwh) * 2) ** 2 * anchors[i]
                 pbox = paddle.concat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target) # 设置梯度
+                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
                 lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
-                score_iou = iou.detach().clip(0).astype(tobj.dtype)
+                iou = iou.detach().clip(0).astype(tobj.dtype)
                 if self.sort_obj_iou:
-                    sort_id = paddle.argsort(score_iou)
-                    b, a, gj, gi, score_iou = b[sort_id], a[sort_id], gj[sort_id], gi[sort_id], score_iou[sort_id]
-                with paddle.no_grad():
-                    tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou  # iou ratio
+                    j = iou.argsort()
+                    b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
+                if self.gr < 1:
+                    iou = (1.0 - self.gr) + self.gr * iou
+                tobj[b, a, gj, gi] = iou  # iou ratio
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = paddle.full_like(ps[:, 5:], self.cn)  # targets
+                    t = paddle.full_like(pcls, self.cn)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += self.BCEcls(pcls.astype("float32"), t.astype("float32"))  # BCE
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in paddle.concat((txy[i], twh[i]), 1)]
-            obji = self.BCEobj(pi[:,:,:,:, 4], tobj)
+
+            obji = self.BCEobj(pi[..., 4].astype("float32"), tobj.astype("float32"))
             lobj += obji * self.balance[i]  # obj loss
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
@@ -169,56 +177,62 @@ class ComputeLoss:
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         tcls, tbox, indices, anch = [], [], [], []
-        gain = np.ones(7, dtype=np.float32)  # normalized to gridspace gain
-        ai = np.tile(np.arange(na, dtype=np.float32).reshape(na, 1), [1, nt])  # same as .repeat_interleave(nt)
-        targets = np.concatenate((np.tile(targets, [na, 1, 1]), ai[:, :, None]), 2)  # append anchor indices
+        gain = paddle.ones([7])  # normalized to gridspace gain
+        ai = paddle.arange(na, dtype=paddle.float32).reshape([na, 1]).tile([1, nt])  # same as .repeat_interleave(nt)
+        targets = paddle.concat((targets.tile([na, 1, 1]), ai[..., None]), 2)  # append anchor indices
 
         g = 0.5  # bias
-        off = np.array([[0, 0],
-                            [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
-                            # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
-                            ], dtype=np.float32) * g  # offsets
+        off = paddle.to_tensor(
+            [
+                [0, 0],
+                [1, 0],
+                [0, 1],
+                [-1, 0],
+                [0, -1],  # j,k,l,m
+                # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+            ],
+            dtype=paddle.float32) * g  # offsets
 
         for i in range(self.nl):
-            anchors = self.anchors[i].numpy()
-            gain[2:6] = np.array(p[i].shape, dtype=np.float32)[[3, 2, 3, 2]]  # xyxy gain
+            anchors, shape = self.anchors[i], p[i].shape
+            gain[2:6] = gain[2:6] * 0 + paddle.to_tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            t = targets * gain
+            t = targets * gain  # shape(3,n,7)
             if nt:
                 # Matches
-                r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
-                j = np.maximum(r, 1 / r).max(2) < self.hyp['anchor_t']  # compare
+                r = t[..., 4:6] / anchors[:, None]  # wh ratio
+                j = paddle.maximum(r, 1 / r).max(2) < self.hyp['anchor_t']  # compare
+                if j.sum().item() == 0:
+                    indices.append((paddle.randn([0,1]), False, False, False))  # image, anchor, grid
+                    tbox.append(False)  # box
+                    anch.append(False)  # anchors
+                    tcls.append(False)  # class
+                    continue
+                # j = wh_iou(anchors, t[:, 4:6]) > de_parallel(model).hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
-
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
                 gxi = gain[[2, 3]] - gxy  # inverse
                 j, k = ((gxy % 1 < g) & (gxy > 1)).T
                 l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                j = np.stack((np.ones_like(j), j, k, l, m))
-                t = np.tile(t, [5, 1, 1])[j]
-                offsets = (np.zeros_like(gxy)[None] + off[:, None])[j]
+                j = paddle.concat((paddle.ones_like(j).unsqueeze(0), j.unsqueeze(0), k.unsqueeze(0), l.unsqueeze(0), m.unsqueeze(0)))
+                t = t.tile((5, 1, 1))[j]
+                offsets = (paddle.zeros_like(gxy)[None] + off[:, None])[j]
             else:
                 t = targets[0]
                 offsets = 0
 
             # Define
-            b, c = t[:, :2].astype(np.int64).T  # image, class
-            gxy = t[:, 2:4]  # grid xy
-            gwh = t[:, 4:6]  # grid wh
-            gij = (gxy - offsets).astype(np.int64)
-            gi, gj = gij.T  # grid xy indices
+            bc, gxy, gwh, a = t.split([2, 2, 2, 1],1)  # (image, class), grid xy, grid wh, anchors
+            a, (b, c) = a.astype(paddle.int64).flatten(), bc.astype(paddle.int64).T  # anchors, image, class
+            gij = (gxy - offsets).astype(paddle.int64)
+            gi, gj = gij.T  # grid indices
 
             # Append
-            a = t[:, 6].astype(np.int64)  # anchor indices
-            gj, gi = gj.clip(0, gain[3] - 1), gi.clip(0, gain[2] - 1) # add line make result same as clamp_
-            indices.append((paddle.to_tensor(b),
-                            paddle.to_tensor(a),
-                            paddle.to_tensor(gj, dtype=paddle.int64),
-                            paddle.to_tensor(gi, dtype=paddle.int64)))  # image, anchor, grid indices
-            tbox.append(paddle.to_tensor(np.concatenate((gxy - gij, gwh), 1), dtype=paddle.float32))  # box
-            anch.append(paddle.to_tensor(anchors[a]))  # anchors
-            tcls.append(paddle.to_tensor(c))  # class
+            indices.append((b, a, gj.clip_(0, shape[2] - 1), gi.clip_(0, shape[3] - 1)))  # image, anchor, grid
+            tbox.append(paddle.concat((gxy - gij, gwh), 1))  # box
+            anch.append(anchors[a])  # anchors
+            tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
