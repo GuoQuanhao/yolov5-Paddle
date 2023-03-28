@@ -91,6 +91,7 @@ python -m paddle.distributed.launch --gpus 0,1,2,3 train.py --weights '' --cfg y
 
 <details>
 <summary>评估</summary>
+
 ```bash
 # (from scratch)Single-GPU or CPU
 python val.py --data coco.yaml --weights yolov5n.pdparams --img 640 --conf 0.001 --iou 0.65 --device ''
@@ -102,12 +103,14 @@ python val.py --data coco.yaml --weights yolov5n.pdparams --img 640 --conf 0.001
 </details>
 
 <details>
-  <summary>YOLOv5 与 YOLOv5-P5 640 Figure</summary>
+  <summary>YOLOv5 与 YOLOv5-P5 640</summary>
 <p align="left"><img width="800" src="https://user-images.githubusercontent.com/26833433/155040763-93c22a27-347c-4e3c-847a-8094621d3f4e.png"></p>
 <p align="left"><img width="800" src="https://user-images.githubusercontent.com/26833433/155040757-ce0934a3-06a6-43dc-a979-2edbbd69ea0e.png"></p>
 </details>
+
 <details>
   <summary>图片中的注意事项</summary>
+
 - **COCO AP val** 表示在 5000 张图像的 [COCO val2017](http://cocodataset.org) 数据集上测量的 mAP@0.5:0.95 指标，推理大小从 256 到 1536。
 - **GPU Speed** 使用批量大小为 32 的 [AWS p3.2xlarge](https://aws.amazon.com/ec2/instance-types/p3/) V100 实例测量 [COCO val2017](http://cocodataset.org) 数据集上每张图像的平均推理时间。
 - **Reproduce** 通过 `python val.py --task study --data coco.yaml --iou 0.7 --weights yolov5n6.pdparams yolov5s6.pdparams yolov5m6.pdparams yolov5l6.pdparams yolov5x6.pdparams`
@@ -117,6 +120,7 @@ python val.py --data coco.yaml --weights yolov5n.pdparams --img 640 --conf 0.001
 <details>
  <summary>目标检测模型权重</summary>
 PaddlePaddle实现了对精度、参数和flops的验证，未利用PaddlePaddle验证推理速度。
+
 | Model                                                                                           | size<br><sup>(pixels) | mAP<sup>val<br>50-95 | mAP<sup>val<br>50 | Speed<br><sup>CPU b1<br>(ms) | Speed<br><sup>V100 b1<br>(ms) | Speed<br><sup>V100 b32<br>(ms) | params<br><sup>(M) | FLOPs<br><sup>@640 (B) |
 | ----------------------------------------------------------------------------------------------- | --------------------- | -------------------- | ----------------- | ---------------------------- | ----------------------------- | ------------------------------ | ------------------ | ---------------------- |
 | YOLOv5n              | 640                   | 28.0                 | 45.7              | **45**                       | **6.3**                       | **0.6**                        | **1.9**            | **4.5**                |
@@ -135,10 +139,10 @@ PaddlePaddle实现了对精度、参数和flops的验证，未利用PaddlePaddle
 <details>
   <summary>表格注意事项</summary>
 
-- All checkpoints are trained to 300 epochs with default settings. Nano and Small models use [hyp.scratch-low.yaml](https://github.com/GuoQuanhao/yolov5-Paddle/blob/main/data/hyps/hyp.scratch-low.yaml) hyps, all others use [hyp.scratch-high.yaml](https://github.com/GuoQuanhao/yolov5-Paddle/blob/main/data/hyps/hyp.scratch-high.yaml).
-- **mAP<sup>val</sup>** values are for single-model single-scale on [COCO val2017](http://cocodataset.org) dataset.<br>Reproduce by `python val.py --data coco.yaml --img 640 --conf 0.001 --iou 0.65`
-- **Speed** averaged over COCO val images using a [AWS p3.2xlarge](https://aws.amazon.com/ec2/instance-types/p3/) instance. NMS times (~1 ms/img) not included.<br>Reproduce by `python val.py --data coco.yaml --img 640 --task speed --batch 1`
-- **TTA** [Test Time Augmentation](https://github.com/ultralytics/yolov5/issues/303) includes reflection and scale augmentations.<br>Reproduce by `python val.py --data coco.yaml --img 1536 --iou 0.7 --augment`
+- 所有模型都采用默认设置训练300轮. Nano和Small模型采用[hyp.scratch-low.yaml](https://github.com/GuoQuanhao/yolov5-Paddle/blob/main/data/hyps/hyp.scratch-low.yaml) hyps, 其余模型采用 [hyp.scratch-high.yaml](https://github.com/GuoQuanhao/yolov5-Paddle/blob/main/data/hyps/hyp.scratch-high.yaml).
+- **mAP<sup>val</sup>** 值适用于 [COCO val2017](http://cocodataset.org)数据集上的单模型单尺度。<br>复现示例：`python val.py --data coco.yaml --img 640 --conf 0.001 --iou 0.65`
+- **Speed** 使用 [AWS p3.2xlarge](https://aws.amazon.com/ec2/instance-types/p3/) 实例对 COCO val 图像进行平均。 NMS 时间 (~1 ms/img) 不包括在内。<br>复现示例：`python val.py --data coco.yaml --img 640 --task speed --batch 1`
+- **TTA** [Test Time Augmentation](https://github.com/ultralytics/yolov5/issues/303) 包括反射和尺度增强。<br>复现示例：`python val.py --data coco.yaml --img 1536 --iou 0.7 --augment`
 
 </details>
 
