@@ -1,0 +1,23 @@
+2023-03-08 注释了requirements.txt
+2023-03-09 device还没处理，保存模型还没处理，check_version可能用不上，thop需要重写， device没写，PIN_MEMORY没处理，完成model前向
+2023-03-09 完成数据读取dataloaders.py完全改写
+2023-03-10 完成简单训练，完成部分train和val代码，device部分没写完，主要考虑到多卡的易用性，得思考思考
+2023-03-11 改了COCO yaml export.py修改部分
+2023-03-12 改了attemp_load函数，但是fuse有问题，精简了val.py，改写non_max_suppression
+2023-03-15 mAP50-95对不上，很奇怪
+2023-03-16 val写完了，权重能够对齐，半精度和双精度对齐完成，train基本完成，还差模型保存部分
+2023-03-16 val和train写完了，完成tensorboard的visualDL完全替代，其中visualDL存在bug，修改完成并提交pr，还差分割和分类
+2023-03-17 用于分割的train和val写完了，model.warmup还没完成 
+2023-03-18 完全构建检测和分割的全部功能代码，对分类进行小改，分割和检测的预测代码进行小改，torchvision部分还没完成，Paddle的分类模型只能从检测模型构建，但是多出SPPF模块，改成9就行
+2023-03-19 改成9可能不对，DetectMultiBackend需要兼容分类模型·
+2023-03-20 完成DetectMultiBackend兼容，对齐分类模型精度，文件清洗细化还未完成，训练精度不变化，deepcopy与visualDL冲突，解决检测模型训练问题，解决deepcopy警告问题，解决分类模型训练问题，还剩分割，以及三种模型的预测脚本
+2023-03-22 检测部分完全拿捏，训练，推理，预测，断点续训，预训练和scratch
+2023-03-23 分类和分割全部拿捏，顺便实现attempt_load函数，发现精度验证过程中，seg验证出来的mask能对上，box对不上
+2023-03-24 所有精度全部对齐，代码还未清理，买了个百度云服务器实现attempt_download函数，文件已传服务器，ONNX和PaddleInference的部署调通了，TensorRT和OpenVIVO没整，OpenCV的dnn推理没整
+2023-03-26 完成PaddleInference，TensorRT，OpenVIVO的转换和推理，以及精度对齐，python3.8没有现成的PaddleLite whl包，实现了PaddleLite编译和模型转换，推理后端还没写完，dnn还没开始
+2023-03-27 搞定所有推理后端，代码清洗，export需要修改以支持half推理，完成benchmark，OMP_NUM_THREADS可能有问题，完成所有导出模型的float16和float32推理，完成所有代码结构，完成部分代码清洗，可尝试Triton
+2023-03-28 多卡是真难，搞清楚了单机多卡的rank和local rank，完成指定单卡、cpu、多卡训练，进行代码清洗，实现tutorial
+
+python -m paddle.distributed.launch --selected_gpus '0,1,2,3' train.py --weights yolov5s.pdparams --data coco.yaml --epochs 5 --device 0,1,2,3
+python train.py --weights yolov5s.pdparams --data coco.yaml --device cpu --epochs 1
+python train.py --weights yolov5s.pdparams --data coco.yaml --device 2 --epochs 1
