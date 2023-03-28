@@ -122,7 +122,6 @@ python val.py --data coco.yaml --weights yolov5n.pdparams --img 640 --conf 0.001
 
 - **COCO AP val** denotes mAP@0.5:0.95 metric measured on the 5000-image [COCO val2017](http://cocodataset.org) dataset over various inference sizes from 256 to 1536.
 - **GPU Speed** measures average inference time per image on [COCO val2017](http://cocodataset.org) dataset using a [AWS p3.2xlarge](https://aws.amazon.com/ec2/instance-types/p3/) V100 instance at batch-size 32.
-- **EfficientDet** data from [google/automl](https://github.com/google/automl) at batch size 8.
 - **Reproduce** by `python val.py --task study --data coco.yaml --iou 0.7 --weights yolov5n6.pdparams yolov5s6.pdparams yolov5m6.pdparams yolov5l6.pdparams yolov5x6.pdparams`
 
 </details>
