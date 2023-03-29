@@ -263,7 +263,7 @@ def reshape_classifier_output(model, n=1000):
 
 
 def device_count():
-    # Returns number of CUDA devices available. Safe version of paddle.cuda.device_count(). Supports Linux and Windows
+    # Returns number of CUDA devices available. Safe version of paddle.device.cuda.device_count(). Supports Linux and Windows
     assert platform.system() in ('Linux', 'Windows'), 'device_count() only supported on Linux or Windows'
     try:
         cmd = 'nvidia-smi -L | wc -l' if platform.system() == 'Linux' else 'nvidia-smi -L | find /c /v ""'  # Windows
@@ -307,34 +307,29 @@ def select_device(device='', batch_size=0, newline=True):
 
 def time_sync():
     # PaddlePaddle-accurate time
-    if paddle.cuda.is_available():
-        paddle.cuda.synchronize()
+    if paddle.device.is_compiled_with_cuda():
+        paddle.device.cuda.synchronize()
     return time.time()
 
 
-def profile(input, ops, n=10, device=None):
+def profile(input, ops, n=10):
     """ YOLOv5 speed/memory/FLOPs profiler
     Usage:
         input = paddle.randn(16, 3, 640, 640)
-        m1 = lambda x: x * paddle.sigmoid(x)
+        m1 = lambda x: x * F.sigmoid(x)
         m2 = nn.Silu()
         profile(input, [m1, m2], n=100)  # profile over 100 iterations
     """
     results = []
-    if not isinstance(device, paddle.device):
-        device = select_device(device)
     print(f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
           f"{'input':>24s}{'output':>24s}")
 
     for x in input if isinstance(input, list) else [input]:
-        x = x.to(device)
         x.stop_gradient = False
         for m in ops if isinstance(ops, list) else [ops]:
-            m = m.to(device) if hasattr(m, 'to') else m  # device
-            m = m.half() if hasattr(m, 'half') and isinstance(x, paddle.Tensor) and x.dtype is paddle.float16 else m
             tf, tb, t = 0, 0, [0, 0, 0]  # dt forward, backward
             try:
-                flops = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2  # GFLOPs
+                flops = paddle_profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2  # GFLOPs
             except Exception:
                 flops = 0
 
@@ -351,15 +346,15 @@ def profile(input, ops, n=10, device=None):
                         t[2] = float('nan')
                     tf += (t[1] - t[0]) * 1000 / n  # ms per op forward
                     tb += (t[2] - t[1]) * 1000 / n  # ms per op backward
-                mem = paddle.cuda.memory_reserved() / 1E9 if paddle.cuda.is_available() else 0  # (GB)
+                mem = paddle.device.cuda.memory_reserved() / 1E9 if paddle.device.is_compiled_with_cuda() else 0  # (GB)
                 s_in, s_out = (tuple(x.shape) if isinstance(x, paddle.Tensor) else 'list' for x in (x, y))  # shapes
-                p = sum(x.numel() for x in m.parameters()) if isinstance(m, nn.Module) else 0  # parameters
+                p = sum(x.numel() for x in m.parameters()).item() if isinstance(m, nn.Layer) else 0  # parameters
                 print(f'{p:12}{flops:12.4g}{mem:>14.3f}{tf:14.4g}{tb:14.4g}{str(s_in):>24s}{str(s_out):>24s}')
                 results.append([p, flops, mem, tf, tb, s_in, s_out])
             except Exception as e:
                 print(e)
                 results.append(None)
-            paddle.cuda.empty_cache()
+            paddle.device.cuda.empty_cache()
     return results
 
 
