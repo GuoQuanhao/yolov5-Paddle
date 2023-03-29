@@ -47,15 +47,12 @@ def autobatch(model, imgsz=640, fraction=0.8, batch_size=16):
 
     # Profile batch sizes
     batch_sizes = [1, 2, 4, 8, 16]
-    img = [paddle.empty([b, 3, imgsz, imgsz]) for b in batch_sizes]
-    results = profile(img, model, n=3)
-    '''
     try:
         img = [paddle.empty([b, 3, imgsz, imgsz]) for b in batch_sizes]
         results = profile(img, model, n=3)
     except Exception as e:
         LOGGER.warning(f'{prefix}{e}')
-    '''
+
     # Fit a solution
     y = [x[2] for x in results if x]  # memory [2]
     p = np.polyfit(batch_sizes[:len(y)], y, deg=1)  # first degree polynomial fit
