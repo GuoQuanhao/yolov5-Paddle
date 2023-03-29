@@ -17,7 +17,4 @@
 2023-03-26 完成PaddleInference，TensorRT，OpenVIVO的转换和推理，以及精度对齐，python3.8没有现成的PaddleLite whl包，实现了PaddleLite编译和模型转换，推理后端还没写完，dnn还没开始
 2023-03-27 搞定所有推理后端，代码清洗，export需要修改以支持half推理，完成benchmark，OMP_NUM_THREADS可能有问题，完成所有导出模型的float16和float32推理，完成所有代码结构，完成部分代码清洗，可尝试Triton
 2023-03-28 多卡是真难，搞清楚了单机多卡的rank和local rank，完成指定单卡、cpu、多卡训练，进行代码清洗，实现tutorial
-
-python -m paddle.distributed.launch --selected_gpus '0,1,2,3' train.py --weights yolov5s.pdparams --data coco.yaml --epochs 5 --device 0,1,2,3
-python train.py --weights yolov5s.pdparams --data coco.yaml --device cpu --epochs 1
-python train.py --weights yolov5s.pdparams --data coco.yaml --device 2 --epochs 1
+2023-03-29 完成AIStudio
