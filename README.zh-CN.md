@@ -28,34 +28,6 @@ cd yolov5-Paddle
 pip install -r requirements.txt  # install
 ```
 
-
-<details>
-<summary>推理</summary>
-
-YOLOv5 PaddlePaddle inference. Models download automatically from the latest
-
-```python
-# Model
-python hubconf.py  # or yolov5n - yolov5x6, custom
-```
-
-`detect.py` 能够利用`--source`指定各种媒体资源，并自动从百度云智能云服务器下载PaddlePaddle模型，并将检测结果保存在`runs/detect`。
-
-```bash
-python detect.py --weights yolov5s.pdparams --source 0                         # webcam
-                                               img.jpg                         # image
-                                               vid.mp4                         # video
-                                               screen                          # screenshot
-                                               path/                           # directory
-                                               list.txt                        # list of images
-                                               list.streams                    # list of streams
-                                               'path/*.jpg'                    # glob
-                                               'https://youtu.be/Zgi9g1ksQHc'  # YouTube
-                                               'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP stream
-```
-
-</details>
-
 <details>
 <summary>训练</summary>
 
@@ -99,6 +71,51 @@ python val.py --data coco.yaml --weights yolov5n.pdparams --img 640 --conf 0.001
                                          yolov5m                                                     0
                                          yolov5l                                                     1
                                          yolov5x                                                     2
+```
+</details>
+
+<details>
+<summary>推理</summary>
+
+YOLOv5 PaddlePaddle inference. Models download automatically from the latest
+
+```python
+# Model
+python hubconf.py  # or yolov5n - yolov5x6, custom
+```
+
+`detect.py` 能够利用`--source`指定各种媒体资源，并自动从百度云智能云服务器下载PaddlePaddle模型，并将检测结果保存在`runs/detect`。
+
+```bash
+python detect.py --weights yolov5s.pdparams --source 0                         # webcam
+                                               img.jpg                         # image
+                                               vid.mp4                         # video
+                                               screen                          # screenshot
+                                               path/                           # directory
+                                               list.txt                        # list of images
+                                               list.streams                    # list of streams
+                                               'path/*.jpg'                    # glob
+                                               'https://youtu.be/Zgi9g1ksQHc'  # YouTube
+                                               'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP stream
+```
+
+</details>
+
+<details>
+<summary>benchmark</summary>
+
+```bash
+python benchmarks.py --weights ./yolov5s.pdparams --device 0
+```
+```
+Benchmarks complete (187.81s)
+            Format  Size (MB)  mAP50-95  Inference time (ms)
+0     PaddlePaddle       13.9    0.4716                 9.75
+1  PaddleInference       27.8    0.4716                20.82
+2             ONNX       27.6    0.4717                32.23
+3         TensorRT       32.2    0.4717                 3.05
+4         OpenVINO       27.9    0.4717                43.67
+5       PaddleLite       27.8    0.4717               264.86
 ```
 </details>
 
