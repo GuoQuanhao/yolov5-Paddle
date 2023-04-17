@@ -176,7 +176,7 @@ python export.py --weights yolov5n.pdparams --include paddleinfer onnx engine op
 你可以使用 `--dynamic` or `--half` 来导出动态维度或半精度模型。
 </details>
 
-## <div align="center">Segmentation</div>
+## <div align="center">分割</div>
 
 <details>
   <summary>图像分割模型权重</summary>
